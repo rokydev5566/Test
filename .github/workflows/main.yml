@@ -1,160 +1,135 @@
-name: "Android Redroid + Public Screen"
+name: "Fast Redroid Android"
 
 on:
   workflow_dispatch:
     inputs:
       vnc_password:
-        description: "VNC password (min 6 chars)"
         required: true
         default: "redroid123"
       keepalive_min:
-        description: "Keep alive minutes (max 360)"
         required: false
         default: "60"
 
 jobs:
   redroid:
-    runs-on: ubuntu-latest
-    steps:
-      # ---------- 1. Kernel modules ----------
-      - name: "Load kernel modules"
-        run: |
-          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" 2>&1 || echo "binder load failed"
-          sudo modprobe ashmem_linux 2>&1 || echo "ashmem load failed"
-          echo "--- Loaded ---"
-          lsmod | grep -E "binder|ashmem" || echo "NONE LOADED (warning)"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
 
-      # ---------- 2. Redroid container ----------
-      - name: "Pull + Run Redroid"
+    steps:
+      # ============ 1. Fast kernel module load ============
+      - name: "Load binder modules"
         run: |
-          docker pull redroid/redroid:11.0.0-latest
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq linux-modules-extra-$(uname -r) adb scrcpy xvfb x11vnc fluxbox novnc websockify wget curl
+          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" 2>&1 || echo "binder fail"
+          sudo modprobe ashmem_linux 2>&1 || echo "ashmem skipped"
+          lsmod | grep -E "binder|ashmem" || echo "NO MODULES"
+          echo "--- Kernel: $(uname -r) ---"
+
+      # ============ 2. Pre-pull image (parallel) ============
+      - name: "Pull Redroid image"
+        run: |
+          docker pull redroid/redroid:12.0.0_64only-latest &
+          wait
+          docker images | grep redroid
+
+      # ============ 3. Fast container start ============
+      - name: "Start Redroid (fast boot flags)"
+        run: |
           docker run -d --privileged --name redroid \
             -p 5555:5555 \
-            redroid/redroid:11.0.0-latest \
+            redroid/redroid:12.0.0_64only-latest \
             androidboot.redroid_gpu_mode=guest \
             androidboot.redroid_width=720 \
             androidboot.redroid_height=1280 \
-            androidboot.redroid_dpi=240
+            androidboot.redroid_dpi=240 \
+            androidboot.redroid_fps=30 \
+            androidboot.use_memfd=1 \
+            androidboot.redroid_net_ndns=1 \
+            androidboot.redroid_net_dns1=8.8.8.8 \
+            androidboot.redroid_net_dns2=8.8.4.4 \
+            androidboot.selinux=permissive
+          
+          echo "Container started"
+          sleep 5
+          docker logs redroid 2>&1 | tail -10
 
-          echo "Container started, waiting 15s..."
-          sleep 15
-          docker ps | grep redroid
-          docker logs redroid 2>&1 | tail -20 || true
-
-      # ---------- 3. Tools ----------
-      - name: "Install ADB + scrcpy + VNC tools"
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq adb scrcpy xvfb x11vnc fluxbox novnc websockify wget curl
-
-      # ---------- 4. WAIT for Android boot (proper) ----------
-      - name: "Wait for Android boot"
+      # ============ 4. Fast boot wait (max 5 min) ============
+      - name: "Wait for boot (max 5 min)"
         run: |
           adb kill-server || true
           adb start-server
           adb connect localhost:5555 || true
 
-          echo "=== Phase 1: wait for device online ==="
-          for i in $(seq 1 40); do
+          # Total 5 min = 30 attempts x 10s
+          for i in $(seq 1 30); do
             STATE=$(adb devices | grep 5555 | awk '{print $2}' | tr -d '\r')
-            echo "[$i/40] adb state: ${STATE:-none}"
-            if [ "$STATE" = "device" ]; then
+            BOOT=$(adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+            echo "[$i/30] state=$STATE boot=$BOOT"
+            
+            if [ "$BOOT" = "1" ]; then
+              echo "=== BOOTED in $((i*10))s ==="
               break
             fi
             adb connect localhost:5555 2>&1 || true
             sleep 10
           done
 
-          echo "=== Phase 2: wait for sys.boot_completed ==="
-          for i in $(seq 1 30); do
-            BOOT=$(adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
-            echo "[$i/30] boot_completed=${BOOT:-not_set}"
-            if [ "$BOOT" = "1" ]; then
-              echo "Android booted!"
-              break
-            fi
-            sleep 10
-          done
-
-          echo "=== Final device check ==="
           adb devices
-          adb -s localhost:5555 shell getprop ro.build.version.release || echo "getprop failed"
-          adb -s localhost:5555 shell getprop ro.product.model || echo "model failed"
+          adb -s localhost:5555 shell getprop ro.build.version.release || echo "still not ready"
 
-      # ---------- 5. Display + scrcpy ----------
-      - name: "Start virtual display + scrcpy"
+      # ============ 5. Display + scrcpy ============
+      - name: "Start display + scrcpy"
         run: |
           export DISPLAY=:99
           Xvfb :99 -screen 0 720x1280x24 &
-          sleep 3
+          sleep 2
           fluxbox &
           sleep 2
-
           adb connect localhost:5555
           adb -s localhost:5555 wait-for-device
+          scrcpy -s localhost:5555 --max-size 720 --stay-awake --window-title "Redroid" &
+          sleep 8
+          ps aux | grep scrcpy | grep -v grep
 
-          # scrcpy 1.25 — no --no-audio flag
-          scrcpy -s localhost:5555 --max-size 720 --window-title "Redroid" &
-          sleep 10
-
-          # Check scrcpy running
-          ps aux | grep scrcpy | grep -v grep || echo "scrcpy not running"
-
-      # ---------- 6. VNC ----------
-      - name: "Start VNC server"
+      # ============ 6. VNC + noVNC ============
+      - name: "Start VNC + noVNC"
         run: |
           mkdir -p ~/.vnc
           x11vnc -storepasswd "${{ inputs.vnc_password }}" ~/.vnc/passwd
           x11vnc -display :99 -forever -shared -rfbauth ~/.vnc/passwd -rfbport 5900 -noxdamage &
           sleep 3
-          ss -tlnp | grep 5900 || netstat -tlnp | grep 5900 || echo "VNC not listening"
-
-      # ---------- 7. noVNC ----------
-      - name: "Start noVNC"
-        run: |
           websockify --web=/usr/share/novnc/ 6080 localhost:5900 > /tmp/novnc.log 2>&1 &
-          sleep 5
-          ss -tlnp | grep 6080 || netstat -tlnp | grep 6080 || echo "noVNC not listening"
+          sleep 3
+          ss -tlnp | grep -E "5900|6080"
 
-      # ---------- 8. cloudflared ----------
-      - name: "Install cloudflared"
+      # ============ 7. Cloudflare tunnel ============
+      - name: "Start tunnel"
         run: |
           wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared-linux-amd64
           sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
-          cloudflared --version
-
-      # ---------- 9. Tunnel ----------
-      - name: "Start Cloudflare Quick Tunnel"
-        run: |
+          
           cloudflared tunnel --url http://localhost:6080 --no-autoupdate > /tmp/cf.log 2>&1 &
-          sleep 25
-
+          sleep 20
+          
           URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf.log | head -1)
           if [ -z "$URL" ]; then
-            echo "URL not found. Log:"
             cat /tmp/cf.log
             exit 1
           fi
-
+          
           echo "NOVNC_URL=$URL" >> $GITHUB_ENV
           echo ""
           echo "==============================================="
-          echo "Android Redroid is LIVE"
-          echo ""
-          echo "Browser (noVNC):"
-          echo "   $URL/vnc.html"
-          echo ""
-          echo "VNC client:"
-          echo "   Host: ${URL#https://}"
-          echo "   Port: 443"
-          echo "   Password: ${{ inputs.vnc_password }}"
+          echo "🟢 Android Redroid is LIVE"
+          echo "🔗 Browser: $URL/vnc.html"
+          echo "🔐 Password: ${{ inputs.vnc_password }}"
           echo "==============================================="
 
-      # ---------- 10. Keep alive ----------
+      # ============ 8. Keep alive ============
       - name: "Keep alive"
         run: |
-          MIN=${{ inputs.keepalive_min }}
-          echo "Android alive for $MIN minutes"
+          echo "Alive for ${{ inputs.keepalive_min }} min"
           echo "URL: ${{ env.NOVNC_URL }}/vnc.html"
-          sleep $((MIN * 60))
+          sleep $((${{ inputs.keepalive_min }} * 60))
