@@ -11,28 +11,23 @@ on:
         description: "Keep alive minutes (max 360)"
         required: false
         default: "60"
-      apk_url:
-        description: "Optional: APK URL to auto-install"
-        required: false
-        default: ""
 
 jobs:
   redroid:
     runs-on: ubuntu-latest
     steps:
+      # ---------- 1. Kernel modules ----------
       - name: "Load kernel modules"
         run: |
-          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" || true
-          sudo modprobe ashmem_linux || true
-          lsmod | grep -E "binder|ashmem" || echo "modules attempted"
+          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" 2>&1 || echo "binder load failed"
+          sudo modprobe ashmem_linux 2>&1 || echo "ashmem load failed"
+          echo "--- Loaded ---"
+          lsmod | grep -E "binder|ashmem" || echo "NONE LOADED (warning)"
 
-      - name: "Pull Redroid image"
+      # ---------- 2. Redroid container ----------
+      - name: "Pull + Run Redroid"
         run: |
           docker pull redroid/redroid:11.0.0-latest
-          docker images | grep redroid
-
-      - name: "Run Redroid"
-        run: |
           docker run -d --privileged --name redroid \
             -p 5555:5555 \
             redroid/redroid:11.0.0-latest \
@@ -41,20 +36,52 @@ jobs:
             androidboot.redroid_height=1280 \
             androidboot.redroid_dpi=240
 
-      - name: "Install tools"
+          echo "Container started, waiting 15s..."
+          sleep 15
+          docker ps | grep redroid
+          docker logs redroid 2>&1 | tail -20 || true
+
+      # ---------- 3. Tools ----------
+      - name: "Install ADB + scrcpy + VNC tools"
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq adb scrcpy xvfb x11vnc fluxbox novnc websockify wget curl
-          adb version
-          scrcpy --version
 
+      # ---------- 4. WAIT for Android boot (proper) ----------
       - name: "Wait for Android boot"
         run: |
-          sleep 90
+          adb kill-server || true
+          adb start-server
           adb connect localhost:5555 || true
-          adb devices
-          adb shell getprop ro.build.version.release || echo "not booted"
 
+          echo "=== Phase 1: wait for device online ==="
+          for i in $(seq 1 40); do
+            STATE=$(adb devices | grep 5555 | awk '{print $2}' | tr -d '\r')
+            echo "[$i/40] adb state: ${STATE:-none}"
+            if [ "$STATE" = "device" ]; then
+              break
+            fi
+            adb connect localhost:5555 2>&1 || true
+            sleep 10
+          done
+
+          echo "=== Phase 2: wait for sys.boot_completed ==="
+          for i in $(seq 1 30); do
+            BOOT=$(adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+            echo "[$i/30] boot_completed=${BOOT:-not_set}"
+            if [ "$BOOT" = "1" ]; then
+              echo "Android booted!"
+              break
+            fi
+            sleep 10
+          done
+
+          echo "=== Final device check ==="
+          adb devices
+          adb -s localhost:5555 shell getprop ro.build.version.release || echo "getprop failed"
+          adb -s localhost:5555 shell getprop ro.product.model || echo "model failed"
+
+      # ---------- 5. Display + scrcpy ----------
       - name: "Start virtual display + scrcpy"
         run: |
           export DISPLAY=:99
@@ -62,25 +89,34 @@ jobs:
           sleep 3
           fluxbox &
           sleep 2
-          adb connect localhost:5555
-          scrcpy --no-audio --max-size 720 --window-title "Redroid" &
-          sleep 5
-          echo "scrcpy started"
 
+          adb connect localhost:5555
+          adb -s localhost:5555 wait-for-device
+
+          # scrcpy 1.25 — no --no-audio flag
+          scrcpy -s localhost:5555 --max-size 720 --window-title "Redroid" &
+          sleep 10
+
+          # Check scrcpy running
+          ps aux | grep scrcpy | grep -v grep || echo "scrcpy not running"
+
+      # ---------- 6. VNC ----------
       - name: "Start VNC server"
         run: |
           mkdir -p ~/.vnc
           x11vnc -storepasswd "${{ inputs.vnc_password }}" ~/.vnc/passwd
-          x11vnc -display :99 -forever -shared -rfbauth ~/.vnc/passwd -rfbport 5900 &
+          x11vnc -display :99 -forever -shared -rfbauth ~/.vnc/passwd -rfbport 5900 -noxdamage &
           sleep 3
-          ss -tlnp | grep 5900 || netstat -tlnp | grep 5900
+          ss -tlnp | grep 5900 || netstat -tlnp | grep 5900 || echo "VNC not listening"
 
+      # ---------- 7. noVNC ----------
       - name: "Start noVNC"
         run: |
           websockify --web=/usr/share/novnc/ 6080 localhost:5900 > /tmp/novnc.log 2>&1 &
           sleep 5
-          ss -tlnp | grep 6080 || netstat -tlnp | grep 6080
+          ss -tlnp | grep 6080 || netstat -tlnp | grep 6080 || echo "noVNC not listening"
 
+      # ---------- 8. cloudflared ----------
       - name: "Install cloudflared"
         run: |
           wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
@@ -88,16 +124,19 @@ jobs:
           sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
           cloudflared --version
 
+      # ---------- 9. Tunnel ----------
       - name: "Start Cloudflare Quick Tunnel"
         run: |
           cloudflared tunnel --url http://localhost:6080 --no-autoupdate > /tmp/cf.log 2>&1 &
-          sleep 20
+          sleep 25
+
           URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf.log | head -1)
           if [ -z "$URL" ]; then
             echo "URL not found. Log:"
             cat /tmp/cf.log
             exit 1
           fi
+
           echo "NOVNC_URL=$URL" >> $GITHUB_ENV
           echo ""
           echo "==============================================="
@@ -112,13 +151,7 @@ jobs:
           echo "   Password: ${{ inputs.vnc_password }}"
           echo "==============================================="
 
-      - name: "Install APK (optional)"
-        if: ${{ inputs.apk_url != '' }}
-        run: |
-          adb connect localhost:5555
-          wget -O /tmp/app.apk "${{ inputs.apk_url }}"
-          adb install -r /tmp/app.apk || echo "APK install failed"
-
+      # ---------- 10. Keep alive ----------
       - name: "Keep alive"
         run: |
           MIN=${{ inputs.keepalive_min }}
