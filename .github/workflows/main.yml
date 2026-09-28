@@ -11,6 +11,10 @@ on:
         description: "Keep alive minutes (max 360)"
         required: false
         default: "60"
+      apk_url:
+        description: "Optional: APK URL to auto-install"
+        required: false
+        default: ""
 
 jobs:
   redroid:
@@ -20,15 +24,18 @@ jobs:
         run: |
           sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" || true
           sudo modprobe ashmem_linux || true
+          lsmod | grep -E "binder|ashmem" || echo "modules attempted"
 
-      - name: "Pull Redroid"
-        run: docker pull redroid/redroid:11.0.0_64only-latest
+      - name: "Pull Redroid image"
+        run: |
+          docker pull redroid/redroid:11.0.0-latest
+          docker images | grep redroid
 
       - name: "Run Redroid"
         run: |
           docker run -d --privileged --name redroid \
             -p 5555:5555 \
-            redroid/redroid:11.0.0_64only-latest \
+            redroid/redroid:11.0.0-latest \
             androidboot.redroid_gpu_mode=guest \
             androidboot.redroid_width=720 \
             androidboot.redroid_height=1280 \
@@ -38,18 +45,20 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq adb scrcpy xvfb x11vnc fluxbox novnc websockify wget curl
+          adb version
+          scrcpy --version
 
       - name: "Wait for Android boot"
         run: |
           sleep 90
-          adb connect localhost:5555
+          adb connect localhost:5555 || true
           adb devices
-          adb shell getprop ro.build.version.release
+          adb shell getprop ro.build.version.release || echo "not booted"
 
       - name: "Start virtual display + scrcpy"
         run: |
-          Xvfb :99 -screen 0 720x1280x24 &
           export DISPLAY=:99
+          Xvfb :99 -screen 0 720x1280x24 &
           sleep 3
           fluxbox &
           sleep 2
@@ -64,14 +73,13 @@ jobs:
           x11vnc -storepasswd "${{ inputs.vnc_password }}" ~/.vnc/passwd
           x11vnc -display :99 -forever -shared -rfbauth ~/.vnc/passwd -rfbport 5900 &
           sleep 3
-          ss -tlnp | grep 5900
+          ss -tlnp | grep 5900 || netstat -tlnp | grep 5900
 
-      - name: "Start noVNC (browser access)"
+      - name: "Start noVNC"
         run: |
           websockify --web=/usr/share/novnc/ 6080 localhost:5900 > /tmp/novnc.log 2>&1 &
           sleep 5
-          ss -tlnp | grep 6080
-          echo "noVNC running on port 6080"
+          ss -tlnp | grep 6080 || netstat -tlnp | grep 6080
 
       - name: "Install cloudflared"
         run: |
@@ -80,41 +88,40 @@ jobs:
           sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
           cloudflared --version
 
-      - name: "Start Cloudflare Quick Tunnel (no account needed)"
+      - name: "Start Cloudflare Quick Tunnel"
         run: |
           cloudflared tunnel --url http://localhost:6080 --no-autoupdate > /tmp/cf.log 2>&1 &
           sleep 20
-          
-          # Extract URL
           URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf.log | head -1)
-          
           if [ -z "$URL" ]; then
-            echo "URL not found. Full log:"
+            echo "URL not found. Log:"
             cat /tmp/cf.log
             exit 1
           fi
-          
+          echo "NOVNC_URL=$URL" >> $GITHUB_ENV
           echo ""
           echo "==============================================="
-          echo "🎉 Android Redroid is LIVE"
+          echo "Android Redroid is LIVE"
           echo ""
-          echo "🔗 Open in browser (noVNC):"
+          echo "Browser (noVNC):"
           echo "   $URL/vnc.html"
           echo ""
-          echo "🔐 VNC Password: ${{ inputs.vnc_password }}"
-          echo ""
-          echo "📱 Or use VNC client:"
+          echo "VNC client:"
           echo "   Host: ${URL#https://}"
           echo "   Port: 443"
           echo "   Password: ${{ inputs.vnc_password }}"
           echo "==============================================="
-          
-          # Save URL for later steps
-          echo "NOVNC_URL=$URL" >> $GITHUB_ENV
+
+      - name: "Install APK (optional)"
+        if: ${{ inputs.apk_url != '' }}
+        run: |
+          adb connect localhost:5555
+          wget -O /tmp/app.apk "${{ inputs.apk_url }}"
+          adb install -r /tmp/app.apk || echo "APK install failed"
 
       - name: "Keep alive"
         run: |
           MIN=${{ inputs.keepalive_min }}
-          echo "🟢 Android alive for $MIN minutes"
-          echo "🔗 ${{ env.NOVNC_URL }}/vnc.html"
+          echo "Android alive for $MIN minutes"
+          echo "URL: ${{ env.NOVNC_URL }}/vnc.html"
           sleep $((MIN * 60))
