@@ -1,0 +1,120 @@
+name: "Android Redroid + Public Screen"
+
+on:
+  workflow_dispatch:
+    inputs:
+      vnc_password:
+        description: "VNC password (min 6 chars)"
+        required: true
+        default: "redroid123"
+      keepalive_min:
+        description: "Keep alive minutes (max 360)"
+        required: false
+        default: "60"
+
+jobs:
+  redroid:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Load kernel modules"
+        run: |
+          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" || true
+          sudo modprobe ashmem_linux || true
+
+      - name: "Pull Redroid"
+        run: docker pull redroid/redroid:11.0.0_64only-latest
+
+      - name: "Run Redroid"
+        run: |
+          docker run -d --privileged --name redroid \
+            -p 5555:5555 \
+            redroid/redroid:11.0.0_64only-latest \
+            androidboot.redroid_gpu_mode=guest \
+            androidboot.redroid_width=720 \
+            androidboot.redroid_height=1280 \
+            androidboot.redroid_dpi=240
+
+      - name: "Install tools"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq adb scrcpy xvfb x11vnc fluxbox novnc websockify wget curl
+
+      - name: "Wait for Android boot"
+        run: |
+          sleep 90
+          adb connect localhost:5555
+          adb devices
+          adb shell getprop ro.build.version.release
+
+      - name: "Start virtual display + scrcpy"
+        run: |
+          Xvfb :99 -screen 0 720x1280x24 &
+          export DISPLAY=:99
+          sleep 3
+          fluxbox &
+          sleep 2
+          adb connect localhost:5555
+          scrcpy --no-audio --max-size 720 --window-title "Redroid" &
+          sleep 5
+          echo "scrcpy started"
+
+      - name: "Start VNC server"
+        run: |
+          mkdir -p ~/.vnc
+          x11vnc -storepasswd "${{ inputs.vnc_password }}" ~/.vnc/passwd
+          x11vnc -display :99 -forever -shared -rfbauth ~/.vnc/passwd -rfbport 5900 &
+          sleep 3
+          ss -tlnp | grep 5900
+
+      - name: "Start noVNC (browser access)"
+        run: |
+          websockify --web=/usr/share/novnc/ 6080 localhost:5900 > /tmp/novnc.log 2>&1 &
+          sleep 5
+          ss -tlnp | grep 6080
+          echo "noVNC running on port 6080"
+
+      - name: "Install cloudflared"
+        run: |
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared-linux-amd64
+          sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: "Start Cloudflare Quick Tunnel (no account needed)"
+        run: |
+          cloudflared tunnel --url http://localhost:6080 --no-autoupdate > /tmp/cf.log 2>&1 &
+          sleep 20
+          
+          # Extract URL
+          URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf.log | head -1)
+          
+          if [ -z "$URL" ]; then
+            echo "URL not found. Full log:"
+            cat /tmp/cf.log
+            exit 1
+          fi
+          
+          echo ""
+          echo "==============================================="
+          echo "🎉 Android Redroid is LIVE"
+          echo ""
+          echo "🔗 Open in browser (noVNC):"
+          echo "   $URL/vnc.html"
+          echo ""
+          echo "🔐 VNC Password: ${{ inputs.vnc_password }}"
+          echo ""
+          echo "📱 Or use VNC client:"
+          echo "   Host: ${URL#https://}"
+          echo "   Port: 443"
+          echo "   Password: ${{ inputs.vnc_password }}"
+          echo "==============================================="
+          
+          # Save URL for later steps
+          echo "NOVNC_URL=$URL" >> $GITHUB_ENV
+
+      - name: "Keep alive"
+        run: |
+          MIN=${{ inputs.keepalive_min }}
+          echo "🟢 Android alive for $MIN minutes"
+          echo "🔗 ${{ env.NOVNC_URL }}/vnc.html"
+          sleep $((MIN * 60))
