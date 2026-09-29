@@ -16,7 +16,7 @@ RAM_LIMIT = '2g'
 SERVER_LIMIT = 12
 LOGS_CHANNEL_ID = 123456789    # CHANGE TO YOUR LOGS CHANNEL ID
 
-# Admin User IDs (comma-separated for multiple admins)
+# Admin User IDs
 ADMIN_USER_IDS = [1155148045231591539]  # CHANGE TO YOUR USER ID(S)
 
 database_file = 'database.txt'
@@ -213,6 +213,50 @@ async def wait_for_pinggy(container_id, max_wait=60):
             print(f"wait_for_pinggy error: {e}")
     return None
 
+def docker_run_container(image, memory=None, cpus=None):
+    """Build docker run command with memory/CPU controls. Falls back gracefully if cgroups fail."""
+    base_cmd = ["docker", "run", "-itd", "--privileged"]
+
+    # Try with memory + cgroupns first
+    if memory:
+        cmd = base_cmd + ["--cgroupns=host", "--memory", memory]
+        if cpus:
+            cmd += ["--cpus", cpus]
+        cmd.append(image)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if result.returncode == 0:
+                return result.stdout.strip(), None
+            error_msg = result.stderr.strip()
+            print(f"Memory-limited run failed: {error_msg}")
+        except Exception as e:
+            error_msg = str(e)
+            print(f"Memory-limited run exception: {error_msg}")
+    else:
+        error_msg = "No memory limit specified"
+
+    # Fallback: try without memory, with cgroupns=host
+    fallback_cmd = base_cmd + ["--cgroupns=host", image]
+    try:
+        result = subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0:
+            return result.stdout.strip(), f"Memory limit unavailable on this host ({error_msg[:100]})"
+        error_msg2 = result.stderr.strip()
+        print(f"cgroupns=host run failed: {error_msg2}")
+    except Exception as e:
+        error_msg2 = str(e)
+        print(f"cgroupns=host exception: {error_msg2}")
+
+    # Last fallback: plain privileged
+    plain_cmd = base_cmd + [image]
+    try:
+        result = subprocess.run(plain_cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0:
+            return result.stdout.strip(), "Running without memory/CPU limits (host cgroup restriction)"
+        return None, result.stderr.strip()
+    except Exception as e:
+        return None, str(e)
+
 @bot.event
 async def on_ready():
     change_status.start()
@@ -251,8 +295,14 @@ async def send_to_logs(message):
         print(f"Failed to send logs: {e}")
 
 @bot.tree.command(name="deploy", description="🚀 [ADMIN] Create a new cloud instance for a user")
-@app_commands.describe(user="The user to deploy for", os="The OS to deploy (ubuntu, debian, alpine, arch, kali, fedora)")
-async def deploy(interaction: discord.Interaction, user: discord.User, os: str):
+@app_commands.describe(
+    user="The user to deploy for",
+    os="The OS to deploy (ubuntu, debian, alpine, arch, kali, fedora)",
+    ram="RAM limit (e.g. 512m, 1g, 2g) — default 2g",
+    cpu="CPU limit (e.g. 1, 1.5, 2) — optional"
+)
+async def deploy(interaction: discord.Interaction, user: discord.User, os: str,
+                 ram: str = RAM_LIMIT, cpu: str = None):
     try:
         if not await is_admin_role_only(interaction):
             await interaction.response.send_message(embed=discord.Embed(
@@ -270,6 +320,14 @@ async def deploy(interaction: discord.Interaction, user: discord.User, os: str):
                 color=EMBED_COLOR), ephemeral=True)
             return
 
+        # Validate RAM format
+        if not re.match(r'^\d+(\.\d+)?[mg]$', ram.lower()):
+            await interaction.response.send_message(embed=discord.Embed(
+                title="❌ Invalid RAM Format",
+                description="Use format like `512m`, `1g`, `2g`.",
+                color=0xFF0000), ephemeral=True)
+            return
+
         if count_user_servers(str(user)) >= SERVER_LIMIT:
             await interaction.response.send_message(embed=discord.Embed(
                 title="🚫 Server Limit Reached",
@@ -284,8 +342,9 @@ async def deploy(interaction: discord.Interaction, user: discord.User, os: str):
             title=f"🚀 Launching {os_data['emoji']} {os_data['name']} Instance",
             description=f"```diff\n+ Preparing {os_data['name']} for {user.display_name}...\n```",
             color=EMBED_COLOR)
+        cpu_text = f"{cpu} vCPU" if cpu else "unlimited"
         embed.add_field(name="🛠️ System Info",
-                        value=f"```RAM: {RAM_LIMIT}\nTunnel: Pinggy```",
+                        value=f"```RAM: {ram}\nCPU: {cpu_text}\nTunnel: Pinggy```",
                         inline=False)
         embed.set_footer(text="This may take 1-2 minutes...")
         await interaction.response.send_message(embed=embed)
@@ -293,10 +352,19 @@ async def deploy(interaction: discord.Interaction, user: discord.User, os: str):
         await animate_message(msg, embed, DEPLOY_ANIMATION, 2, "Initializing Deployment")
 
         try:
-            container_id = subprocess.check_output(
-                ["docker", "run", "-itd", "--privileged", "--memory", RAM_LIMIT, os_data["image"]]
-            ).strip().decode('utf-8')
-            await send_to_logs(f"🔧 {interaction.user.mention} deployed {os_data['emoji']} {os_data['name']} for {user.mention} (ID: `{container_id[:12]}`)")
+            container_id, warning = docker_run_container(os_data["image"], memory=ram, cpus=cpu)
+
+            if not container_id:
+                await msg.edit(embed=discord.Embed(
+                    title=f"❌ Deployment Failed {random.choice(ERROR_ANIMATION)}",
+                    description=f"```diff\n- Docker run failed:\n{(warning or 'Unknown error')[:300]}\n```",
+                    color=0xFF0000))
+                return
+
+            if warning:
+                await send_to_logs(f"⚠️ {interaction.user.mention} deploy warning: {warning}")
+
+            await send_to_logs(f"🔧 {interaction.user.mention} deployed {os_data['emoji']} {os_data['name']} for {user.mention} (ID: `{container_id[:12]}`, RAM: {ram})")
 
             embed.description = "```diff\n+ Installing SSH and configuring root password...\n```"
             await msg.edit(embed=embed)
@@ -315,8 +383,10 @@ async def deploy(interaction: discord.Interaction, user: discord.User, os: str):
                     color=0x00FF00)
                 admin_embed.add_field(name="🔐 Root Password", value=f"```{root_password}```", inline=False)
                 admin_embed.add_field(name="📦 Container Info",
-                                      value=f"```ID: {container_id[:12]}\nOS: {os_data['name']}\nRAM: {RAM_LIMIT}\nStatus: Running```",
+                                      value=f"```ID: {container_id[:12]}\nOS: {os_data['name']}\nRAM: {ram}\nCPU: {cpu_text}\nStatus: Running```",
                                       inline=False)
+                if warning:
+                    admin_embed.add_field(name="⚠️ Warning", value=f"```{warning[:200]}```", inline=False)
                 await interaction.followup.send(embed=admin_embed, ephemeral=True)
 
                 try:
@@ -336,7 +406,7 @@ async def deploy(interaction: discord.Interaction, user: discord.User, os: str):
 
                 final = discord.Embed(
                     title=f"✅ Deployment Complete! {random.choice(SUCCESS_ANIMATION)}",
-                    description=f"**{os_data['emoji']} {os_data['name']}** created for {user.mention}!\n\n**SSH:**\n```{ssh_command}```\n**Password:** `{root_password}`",
+                    description=f"**{os_data['emoji']} {os_data['name']}** created for {user.mention}!\n\n**SSH:**\n```{ssh_command}```\n**Password:** `{root_password}`\n**RAM:** `{ram}`",
                     color=0x00FF00)
                 await msg.edit(embed=final)
             else:
@@ -350,7 +420,7 @@ async def deploy(interaction: discord.Interaction, user: discord.User, os: str):
         except subprocess.CalledProcessError as e:
             await msg.edit(embed=discord.Embed(
                 title=f"❌ Deployment Failed {random.choice(ERROR_ANIMATION)}",
-                description=f"```diff\n- Error:\n{e}\n```", color=0xFF0000))
+                description=f"```diff\n- Error:\n{str(e)[:300]}\n```", color=0xFF0000))
             await send_to_logs(f"💥 Deployment failed for {user.mention}: {e}")
 
     except Exception as e:
@@ -358,7 +428,7 @@ async def deploy(interaction: discord.Interaction, user: discord.User, os: str):
         try:
             await interaction.followup.send(embed=discord.Embed(
                 title="💥 Critical Error",
-                description="```diff\n- Unexpected error\n- Try again later\n```",
+                description=f"```diff\n- {str(e)[:300]}\n```",
                 color=0xFF0000))
         except Exception:
             pass
@@ -443,13 +513,13 @@ async def start_server(interaction: discord.Interaction, container_id: str):
         except subprocess.CalledProcessError as e:
             await msg.edit(embed=discord.Embed(
                 title=f"❌ Start Failed {random.choice(ERROR_ANIMATION)}",
-                description=f"```{e}```", color=0xFF0000))
+                description=f"```{str(e)[:300]}```", color=0xFF0000))
 
     except Exception as e:
         print(f"Error in start: {e}")
         try:
             await interaction.followup.send(embed=discord.Embed(
-                title="💥 Error", description="```Something went wrong.```", color=0xFF0000))
+                title="💥 Error", description=f"```{str(e)[:300]}```", color=0xFF0000))
         except Exception:
             pass
 
@@ -510,14 +580,14 @@ async def stop_server(interaction: discord.Interaction, container_id: str):
         except subprocess.CalledProcessError as e:
             await msg.edit(embed=discord.Embed(
                 title=f"❌ Stop Failed {random.choice(ERROR_ANIMATION)}",
-                description=f"```{e.stderr if e.stderr else e.stdout}```",
+                description=f"```{str(e)[:300]}```",
                 color=0xFF0000))
 
     except Exception as e:
         print(f"Error in stop: {e}")
         try:
             await interaction.followup.send(embed=discord.Embed(
-                title="💥 Error", description="```Something went wrong.```", color=0xFF0000))
+                title="💥 Error", description=f"```{str(e)[:300]}```", color=0xFF0000))
         except Exception:
             pass
 
@@ -602,14 +672,14 @@ async def restart_server(interaction: discord.Interaction, container_id: str):
         except subprocess.CalledProcessError as e:
             await msg.edit(embed=discord.Embed(
                 title=f"❌ Restart Failed {random.choice(ERROR_ANIMATION)}",
-                description=f"```{e.stderr if e.stderr else e.stdout}```",
+                description=f"```{str(e)[:300]}```",
                 color=0xFF0000))
 
     except Exception as e:
         print(f"Error in restart: {e}")
         try:
             await interaction.followup.send(embed=discord.Embed(
-                title="💥 Error", description="```Something went wrong.```", color=0xFF0000))
+                title="💥 Error", description=f"```{str(e)[:300]}```", color=0xFF0000))
         except Exception:
             pass
 
@@ -680,7 +750,7 @@ async def regen_ssh(interaction: discord.Interaction, container_id: str):
         print(f"Error in regen-ssh: {e}")
         try:
             await interaction.followup.send(embed=discord.Embed(
-                title="💥 Error", description="```Something went wrong.```", color=0xFF0000))
+                title="💥 Error", description=f"```{str(e)[:300]}```", color=0xFF0000))
         except Exception:
             pass
 
@@ -752,7 +822,7 @@ async def remove_server(interaction: discord.Interaction, container_id: str):
         print(f"Error in remove: {e}")
         try:
             await interaction.followup.send(embed=discord.Embed(
-                title="💥 Error", description="```Something went wrong.```", color=0xFF0000))
+                title="💥 Error", description=f"```{str(e)[:300]}```", color=0xFF0000))
         except Exception:
             pass
 
@@ -804,7 +874,7 @@ async def list_servers(interaction: discord.Interaction):
         print(f"Error in list: {e}")
         try:
             await interaction.response.send_message(embed=discord.Embed(
-                title="💥 Error", description="```Something went wrong.```", color=0xFF0000), ephemeral=True)
+                title="💥 Error", description=f"```{str(e)[:300]}```", color=0xFF0000), ephemeral=True)
         except Exception:
             pass
 
@@ -870,7 +940,7 @@ async def list_all_servers(interaction: discord.Interaction):
         print(f"Error in list-all: {e}")
         try:
             await interaction.followup.send(embed=discord.Embed(
-                title="💥 Error", description="```Something went wrong.```", color=0xFF0000))
+                title="💥 Error", description=f"```{str(e)[:300]}```", color=0xFF0000))
         except Exception:
             pass
 
@@ -930,7 +1000,7 @@ async def delete_user_container(interaction: discord.Interaction, container_id: 
         print(f"Error in delete-user-container: {e}")
         try:
             await interaction.followup.send(embed=discord.Embed(
-                title="💥 Error", description="```Something went wrong.```", color=0xFF0000))
+                title="💥 Error", description=f"```{str(e)[:300]}```", color=0xFF0000))
         except Exception:
             pass
 
@@ -960,7 +1030,7 @@ async def resources_command(interaction: discord.Interaction):
         print(f"Error in resources: {e}")
         try:
             await interaction.response.send_message(embed=discord.Embed(
-                title="💥 Error", description="```Something went wrong.```", color=0xFF0000), ephemeral=True)
+                title="💥 Error", description=f"```{str(e)[:300]}```", color=0xFF0000), ephemeral=True)
         except Exception:
             pass
 
@@ -983,7 +1053,7 @@ async def help_command(interaction: discord.Interaction):
             ("ℹ️ `/help`", "Show this help")
         ]
         admin_cmds = [
-            ("🚀 `/deploy user: @user os: <os>`", "[ADMIN] Create instance"),
+            ("🚀 `/deploy user: @user os: <os> ram: <ram> cpu: <cpu>`", "[ADMIN] Create instance with limits"),
             ("📜 `/list-all`", "[ADMIN] List all instances"),
             ("❌ `/delete-user-container <id>`", "[ADMIN] Force-delete container")
         ]
@@ -998,6 +1068,10 @@ async def help_command(interaction: discord.Interaction):
 
         os_info = "\n".join([f"{OS_OPTIONS[o]['emoji']} **{o}** - {OS_OPTIONS[o]['description']}" for o in OS_OPTIONS])
         embed.add_field(name="🖥️ Available OS", value=os_info, inline=False)
+        embed.add_field(
+            name="💡 RAM/CPU Examples",
+            value="```/deploy user:@x os:ubuntu ram:512m cpu:1\n/deploy user:@x os:debian ram:2g cpu:1.5```",
+            inline=False)
         embed.set_footer(text="💜 Need help? Contact staff!")
 
         await interaction.response.send_message(embed=embed)
@@ -1005,7 +1079,7 @@ async def help_command(interaction: discord.Interaction):
         print(f"Error in help: {e}")
         try:
             await interaction.response.send_message(embed=discord.Embed(
-                title="💥 Error", description="```Something went wrong.```", color=0xFF0000), ephemeral=True)
+                title="💥 Error", description=f"```{str(e)[:300]}```", color=0xFF0000), ephemeral=True)
         except Exception:
             pass
 
@@ -1030,7 +1104,7 @@ async def ping_command(interaction: discord.Interaction):
         print(f"Error in ping: {e}")
         try:
             await interaction.response.send_message(embed=discord.Embed(
-                title="💥 Error", description="```Something went wrong.```", color=0xFF0000), ephemeral=True)
+                title="💥 Error", description=f"```{str(e)[:300]}```", color=0xFF0000), ephemeral=True)
         except Exception:
             pass
 
